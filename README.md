@@ -1,4 +1,4 @@
-# Radxa-Orion-O6-custom-BIOS
+# Radxa Orion O6 custom Android BIOS
 
 An Android BIOS (UEFI firmware) for the **Radxa Orion O6** and **Orion O6N**, built in Docker from Radxa's
 official sources, [radxa-pkg/edk2-cix](https://github.com/radxa-pkg/edk2-cix) **1.3.2**, plus five small
