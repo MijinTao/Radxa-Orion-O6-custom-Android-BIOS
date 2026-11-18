@@ -1,0 +1,42 @@
+diff --git a/Platform/Radxa/RadxaCommon.dsc.inc b/Platform/Radxa/RadxaCommon.dsc.inc
+index 81b2138..8d27c6f 100644
+--- a/Platform/Radxa/RadxaCommon.dsc.inc
++++ b/Platform/Radxa/RadxaCommon.dsc.inc
+@@ -16,9 +16,9 @@
+ [BuildOptions]
+   GCC:*_*_*_CC_FLAGS              = -DCOMPILE_BUILD_DATE=$(COMPILE_BUILD_DATE)
+ !if $(TARGET) == RELEASE
+-  GCC:*_*_*_CC_FLAGS              = -DUEFI_FW_VERSION=$(COMPILE_DEB_VERSION)
++  GCC:*_*_*_CC_FLAGS              = -DUEFI_FW_VERSION=$(DMOD_FW_VERSION)
+ !else
+-  GCC:*_*_*_CC_FLAGS              = -DUEFI_FW_VERSION=$(COMPILE_DEB_VERSION)"-"$(COMPILE_COMMIT_HASH)"-debug:"$(COMPILE_BUILD_DATE)
++  GCC:*_*_*_CC_FLAGS              = -DUEFI_FW_VERSION=$(DMOD_FW_VERSION)"-"$(COMPILE_COMMIT_HASH)"-debug:"$(COMPILE_BUILD_DATE)
+ !endif
+ 
+ [PcdsDynamicDefault.common]
+@@ -35,9 +35,9 @@
+ [PcdsFixedAtBuild.common]
+   # Version string
+ !if $(TARGET) == RELEASE
+-  gEfiMdeModulePkgTokenSpaceGuid.PcdFirmwareVersionString|L"$(COMPILE_DEB_VERSION)"
++  gEfiMdeModulePkgTokenSpaceGuid.PcdFirmwareVersionString|L"$(DMOD_FW_VERSION)"
+ !else
+-  gEfiMdeModulePkgTokenSpaceGuid.PcdFirmwareVersionString|L"$(COMPILE_DEB_VERSION)-$(COMPILE_COMMIT_HASH)-debug:$(COMPILE_BUILD_DATE)"
++  gEfiMdeModulePkgTokenSpaceGuid.PcdFirmwareVersionString|L"$(DMOD_FW_VERSION)-$(COMPILE_COMMIT_HASH)-debug:$(COMPILE_BUILD_DATE)"
+ !endif
+ 
+   # Code info
+diff --git a/Platform/Radxa/RadxaDefine.dsc.inc b/Platform/Radxa/RadxaDefine.dsc.inc
+index cc2f209..044e4c9 100644
+--- a/Platform/Radxa/RadxaDefine.dsc.inc
++++ b/Platform/Radxa/RadxaDefine.dsc.inc
+@@ -5,6 +5,9 @@
+   DEFINE COMPILE_DEB_VERSION        = 0.0.1
+ !endif
+ 
++# dmod: BIOS name shown in setup, on the boot console and in SMBIOS
++  DEFINE DMOD_FW_VERSION            = Android-$(COMPILE_DEB_VERSION)-dmod
++
+ !ifdef $(EDK2_COMMIT_HASH)
+   DEFINE COMPILE_EDK2_COMMIT_HASH           = $(EDK2_COMMIT_HASH)
+ !else

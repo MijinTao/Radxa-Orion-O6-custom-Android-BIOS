@@ -1,0 +1,330 @@
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni
+index a97c597..ea46b15 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni
+@@ -75,3 +75,8 @@
+ #string STR_DDR_LOW_POWER_PROMPT_HELP  #language en-US "Firmware DDR low-power mode.\n\n"
+                                                        "<Disabled> (default) turns it off at every boot. With it on, sustained CPU/GPU load can make the power-management firmware stop responding, which freezes or resets the board.\n\n"
+                                                        "<Enabled> keeps the firmware default."
++
++#string STR_DMOD_WIPE_ANDROID_PROMPT   #language en-US "Wipe Android data at next boot"
++#string STR_DMOD_WIPE_ANDROID_HELP     #language en-US "One-shot, for switching BIOS versions or a clean start.\n\n"
++                                                       "<Enabled>: at the next boot, before anything starts, the BIOS erases the Android metadata partition and the start of userdata on the NVMe drive (like fastboot erase). Android then reformats /data with new encryption keys from this BIOS's OP-TEE. All Android apps and data are lost.\n\n"
++                                                       "The option goes back to <Disabled> by itself."
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr
+index f7223c9..aaee17d 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr
+@@ -46,6 +46,11 @@ formset
+     name  = DmodSetupVar,
+     guid  = RADXA_SETUP_VARIABLE_GUID;
+ 
++  efivarstore DMOD_WIPE_DATA,
++    attribute = EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_NON_VOLATILE,
++    name  = DmodWipeAndroid,
++    guid  = RADXA_SETUP_VARIABLE_GUID;
++
+   efivarstore CONSOLE_PREF_VARSTORE_DATA,
+     attribute = EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_NON_VOLATILE,
+     name  = ConsolePref,
+@@ -135,6 +140,14 @@ endif;
+       option text = STRING_TOKEN(STR_ENABLED),  value = 1, flags = RESET_REQUIRED;
+     endoneof;
+ 
++    oneof varid   = DmodWipeAndroid.WipeAndroidData,
++      prompt      = STRING_TOKEN(STR_DMOD_WIPE_ANDROID_PROMPT),
++      help        = STRING_TOKEN(STR_DMOD_WIPE_ANDROID_HELP),
++      default     = 0,
++      option text = STRING_TOKEN(STR_DISABLED), value = 0, flags = RESET_REQUIRED;
++      option text = STRING_TOKEN(STR_ENABLED),  value = 1, flags = RESET_REQUIRED;
++    endoneof;
++
+     oneof varid     = NetworkStackVar.Enable,
+       prompt        = STRING_TOKEN(STR_NETWORK_STACK_PROMPT),
+       help          = STRING_TOKEN(STR_NETWORK_STACK_PROMPT_HELP),
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c
+index ebd9535..a77ae9d 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c
+@@ -12,6 +12,10 @@
+ #include <Library/BaseMemoryLib.h>
+ #include <Library/PcdLib.h>
+ #include <Library/ArmSmcLib.h>
++#include <Library/DevicePathLib.h>
++#include <Library/MemoryAllocationLib.h>
++#include <Protocol/BlockIo.h>
++#include <Protocol/PartitionInfo.h>
+ #include "../../Include/RadxaSetupVar.h"
+ #include "../../Include/DmodSetupVar.h"
+ 
+@@ -59,6 +63,212 @@ DmodApplyDdrLowPower (
+   DEBUG ((DEBUG_INFO, "%a: DDR low-power turned off (ret 0x%lx)\n", __func__, Args.Arg0));
+ }
+ 
++//
++// dmod: "Wipe Android data at next boot" (one-shot, variable DmodWipeAndroid).
++// Android treats a partition whose first 4 KiB are all zero as wiped and reformats it ("formattable" in
++// fstab.cix); /data then gets a new encryption key from the KeyMint in this BIOS's OP-TEE. Zeroing all of
++// "metadata" and the start of "userdata" is the same as "fastboot erase metadata" + "fastboot erase userdata".
++// Only GPT partitions on NVMe drives are touched. Runs once, at ReadyToBoot, before any boot option starts.
++//
++#define DMOD_WIPE_CHUNK           SIZE_1MB
++#define DMOD_WIPE_USERDATA_BYTES  SIZE_1MB
++
++STATIC
++BOOLEAN
++DmodIsOnNvme (
++  IN EFI_HANDLE  Handle
++  )
++{
++  EFI_DEVICE_PATH_PROTOCOL  *Node;
++
++  Node = DevicePathFromHandle (Handle);
++  while ((Node != NULL) && !IsDevicePathEnd (Node)) {
++    if ((DevicePathType (Node) == MESSAGING_DEVICE_PATH) && (DevicePathSubType (Node) == MSG_NVME_NAMESPACE_DP)) {
++      return TRUE;
++    }
++
++    Node = NextDevicePathNode (Node);
++  }
++
++  return FALSE;
++}
++
++STATIC
++UINTN
++DmodWipeAndroidPartitions (
++  VOID
++  )
++{
++  EFI_STATUS                   Status;
++  EFI_HANDLE                   *Handles;
++  UINTN                        Count;
++  UINTN                        Index;
++  EFI_PARTITION_INFO_PROTOCOL  *PartInfo;
++  EFI_BLOCK_IO_PROTOCOL        *BlockIo;
++  UINT64                       Bytes;
++  UINT64                       Done;
++  UINTN                        Chunk;
++  VOID                         *Zero;
++  UINTN                        Wiped;
++  CHAR16                       Name[37];
++
++  Wiped  = 0;
++  Chunk  = 0;
++  Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiPartitionInfoProtocolGuid, NULL, &Count, &Handles);
++  if (EFI_ERROR (Status)) {
++    return 0;
++  }
++
++  Zero = AllocateZeroPool (DMOD_WIPE_CHUNK);
++  if (Zero == NULL) {
++    FreePool (Handles);
++    return 0;
++  }
++
++  for (Index = 0; Index < Count; Index++) {
++    Status = gBS->HandleProtocol (Handles[Index], &gEfiPartitionInfoProtocolGuid, (VOID **)&PartInfo);
++    if (EFI_ERROR (Status) || (PartInfo->Type != PARTITION_TYPE_GPT) || !DmodIsOnNvme (Handles[Index])) {
++      continue;
++    }
++
++    // copy out of the packed protocol structure (aligned, NUL-terminated)
++    CopyMem (Name, (VOID *)PartInfo->Info.Gpt.PartitionName, sizeof (PartInfo->Info.Gpt.PartitionName));
++    Name[36] = L'\0';
++    if (StrCmp (Name, L"metadata") == 0) {
++      Bytes = MAX_UINT64;                       // all of it (16 MiB)
++    } else if (StrCmp (Name, L"userdata") == 0) {
++      Bytes = DMOD_WIPE_USERDATA_BYTES;         // superblocks + the 4 KiB Android checks
++    } else {
++      continue;
++    }
++
++    Status = gBS->HandleProtocol (Handles[Index], &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo);
++    if (EFI_ERROR (Status) || BlockIo->Media->ReadOnly || (BlockIo->Media->BlockSize == 0) ||
++        ((DMOD_WIPE_CHUNK % BlockIo->Media->BlockSize) != 0))
++    {
++      continue;
++    }
++
++    Bytes = MIN (Bytes, MultU64x32 (BlockIo->Media->LastBlock + 1, BlockIo->Media->BlockSize));
++    for (Done = 0; Done < Bytes; Done += Chunk) {
++      Chunk  = (UINTN)MIN ((UINT64)DMOD_WIPE_CHUNK, Bytes - Done);
++      Status = BlockIo->WriteBlocks (
++                          BlockIo,
++                          BlockIo->Media->MediaId,
++                          DivU64x32 (Done, BlockIo->Media->BlockSize),
++                          Chunk,
++                          Zero
++                          );
++      if (EFI_ERROR (Status)) {
++        break;
++      }
++    }
++
++    BlockIo->FlushBlocks (BlockIo);
++    Print (L"dmod: wiped Android %s: %Lu KiB - %r\n", Name, DivU64x32 (Done, 1024), Status);
++    if (!EFI_ERROR (Status)) {
++      Wiped++;
++    }
++  }
++
++  FreePool (Zero);
++  FreePool (Handles);
++  return Wiped;
++}
++
++STATIC
++VOID
++DmodConnectAll (
++  VOID
++  )
++{
++  EFI_HANDLE  *Handles;
++  UINTN       Count;
++  UINTN       Index;
++
++  if (!EFI_ERROR (gBS->LocateHandleBuffer (AllHandles, NULL, NULL, &Count, &Handles))) {
++    for (Index = 0; Index < Count; Index++) {
++      gBS->ConnectController (Handles[Index], NULL, NULL, TRUE);
++    }
++
++    FreePool (Handles);
++  }
++}
++
++STATIC
++VOID
++EFIAPI
++DmodWipeAndroidOnReadyToBoot (
++  IN EFI_EVENT  Event,
++  IN VOID       *Context
++  )
++{
++  EFI_STATUS      Status;
++  UINTN           VarSize;
++  DMOD_WIPE_DATA  Wipe;
++
++  gBS->CloseEvent (Event);                      // once per boot
++
++  VarSize = sizeof (Wipe);
++  Status  = gRT->GetVariable (DMOD_WIPE_VAR, &gRadxaSetupVariableGuid, NULL, &VarSize, &Wipe);
++  if (EFI_ERROR (Status) || (VarSize != sizeof (Wipe)) || (Wipe.WipeAndroidData != DMOD_WIPE_ANDROID_ON)) {
++    return;
++  }
++
++  // One-shot: switch the option off first; if that fails, wipe nothing (never a wipe on every boot).
++  Wipe.WipeAndroidData = DMOD_WIPE_ANDROID_OFF;
++  Status               = gRT->SetVariable (
++                                DMOD_WIPE_VAR,
++                                &gRadxaSetupVariableGuid,
++                                EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS,
++                                sizeof (Wipe),
++                                &Wipe
++                                );
++  if (EFI_ERROR (Status)) {
++    Print (L"dmod: Wipe Android data: could not reset the option (%r) - nothing wiped\n", Status);
++    return;
++  }
++
++  Print (L"dmod: Wipe Android data at next boot: erasing Android metadata + userdata on NVMe\n");
++  if (DmodWipeAndroidPartitions () == 0) {
++    DmodConnectAll ();                          // NVMe may not be connected yet
++    if (DmodWipeAndroidPartitions () == 0) {
++      Print (L"dmod: no Android metadata/userdata partition found on NVMe - nothing wiped\n");
++    }
++  }
++}
++
++//
++// dmod: creates DmodWipeAndroid (Disabled) when it is missing or not the expected size, so the setup page
++// has storage for the option, and arms the ReadyToBoot check.
++//
++STATIC
++VOID
++DmodInitAndroidWipe (
++  VOID
++  )
++{
++  EFI_STATUS      Status;
++  UINTN           VarSize;
++  DMOD_WIPE_DATA  Wipe;
++  EFI_EVENT       Event;
++
++  VarSize = sizeof (Wipe);
++  Status  = gRT->GetVariable (DMOD_WIPE_VAR, &gRadxaSetupVariableGuid, NULL, &VarSize, &Wipe);
++  if (EFI_ERROR (Status) || (VarSize != sizeof (Wipe))) {
++    ZeroMem (&Wipe, sizeof (Wipe));
++    gRT->SetVariable (
++           DMOD_WIPE_VAR,
++           &gRadxaSetupVariableGuid,
++           EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS,
++           sizeof (Wipe),
++           &Wipe
++           );
++  }
++
++  EfiCreateEventReadyToBootEx (TPL_CALLBACK, DmodWipeAndroidOnReadyToBoot, NULL, &Event);
++}
++
+ EFI_STATUS
+ EFIAPI
+ RadxaSetupVariableInitDxeEntry (
+@@ -71,6 +281,7 @@ RadxaSetupVariableInitDxeEntry (
+   RADXA_SETUP_DATA  RadxaSetupVar;
+ 
+   DmodApplyDdrLowPower ();  // dmod
++  DmodInitAndroidWipe ();   // dmod
+ 
+   VarSize = sizeof (RADXA_SETUP_DATA);
+ 
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf
+index 6ee5fce..71cf571 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf
+@@ -39,12 +39,16 @@
+   UefiLib
+   UefiRuntimeServicesTableLib
+   ArmSmcLib  # dmod: DDR low-power SiP call
++  DevicePathLib        # dmod: Wipe Android data
++  MemoryAllocationLib  # dmod: Wipe Android data
+ 
+ [Guids]
+   gRadxaTokenSpaceGuid
+   gRadxaSetupVariableGuid
+ 
+ [Protocols]
++  gEfiPartitionInfoProtocolGuid  # dmod: Wipe Android data
++  gEfiBlockIoProtocolGuid        # dmod: Wipe Android data
+ 
+ [FixedPcd]
+ 
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Include/DmodSetupVar.h b/Platform/Radxa/Platforms/CIX/Sky1/Include/DmodSetupVar.h
+index 4e15145..253421f 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Include/DmodSetupVar.h
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Include/DmodSetupVar.h
+@@ -11,12 +11,24 @@
+ #define DMOD_DDR_LP_OFF  0   // default: turned off at every boot
+ #define DMOD_DDR_LP_ON   1   // leave the firmware default
+ 
++//
++// One-shot "Wipe Android data at next boot", in its own variable so the UEFI Shell can set it alone:
++//   setvar DmodWipeAndroid -guid eedf122d-a912-43d5-aa11-142762dd96fa -bs -nv =01
++//
++#define DMOD_WIPE_VAR          L"DmodWipeAndroid"
++#define DMOD_WIPE_ANDROID_OFF  0   // default
++#define DMOD_WIPE_ANDROID_ON   1   // at the next boot: erase Android metadata + start of userdata (NVMe)
++
+ #pragma pack(1)
+ 
+ typedef struct {
+   UINT8     DdrLowPower;
+ } DMOD_SETUP_DATA;
+ 
++typedef struct {
++  UINT8     WipeAndroidData;
++} DMOD_WIPE_DATA;
++
+ #pragma pack()
+ 
+ #endif

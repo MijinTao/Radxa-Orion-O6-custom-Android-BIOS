@@ -1,0 +1,29 @@
+diff --git a/Platform/CIX/Sky1/Drivers/PlatformSetupVariableInitDxe/PlatformSetupVariableInitDxe.c b/Platform/CIX/Sky1/Drivers/PlatformSetupVariableInitDxe/PlatformSetupVariableInitDxe.c
+index 09b594e..dd44119 100644
+--- a/Platform/CIX/Sky1/Drivers/PlatformSetupVariableInitDxe/PlatformSetupVariableInitDxe.c
++++ b/Platform/CIX/Sky1/Drivers/PlatformSetupVariableInitDxe/PlatformSetupVariableInitDxe.c
+@@ -547,11 +547,23 @@ PlatformSetupVariableInit (
+                   &VarSize,
+                   &PlatformSetupVar
+                   );
++  //
++  // dmod: a PlatformSetupVar of another size was written by another BIOS line (e.g. Radxa's Android
++  // 1.0.0, whose layout lacks Usb3Control0DataRole and the last three fields). Its bytes don't match
++  // this layout: every field after the first difference would be misread (USB-C data role, memory
++  // settings, ...). Treat it like a missing variable: delete it and write this BIOS's defaults.
++  //
++  if ((Status == EFI_BUFFER_TOO_SMALL) || (!EFI_ERROR (Status) && (VarSize != sizeof (PLATFORM_SETUP_DATA)))) {
++    DEBUG ((DEBUG_WARN, "%a: %s has %u bytes, expected %u - rebuilding defaults\n", __func__, PLATFORM_SETUP_VAR, (UINT32)VarSize, (UINT32)sizeof (PLATFORM_SETUP_DATA)));
++    gRT->SetVariable (PLATFORM_SETUP_VAR, &gPlatformSetupVariableGuid, 0, 0, NULL);
++    Status = EFI_NOT_FOUND;
++  }
++
+   if (EFI_ERROR (Status)) {
+     //
+     // Variable does not exist yet - create it
+     //
+-    ZeroMem (&PlatformSetupVar, VarSize);
++    ZeroMem (&PlatformSetupVar, sizeof (PlatformSetupVar));  // dmod: VarSize may be the bigger stored size
+     ConstructSetupVariable (&PlatformSetupVar);
+ 
+     Status = gRT->SetVariable (

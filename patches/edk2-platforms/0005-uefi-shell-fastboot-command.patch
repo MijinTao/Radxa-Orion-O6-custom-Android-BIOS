@@ -1,0 +1,250 @@
+diff --git a/Platform/Radxa/Orion/O6/O6.dsc b/Platform/Radxa/Orion/O6/O6.dsc
+index 6619164..03fcc82 100644
+--- a/Platform/Radxa/Orion/O6/O6.dsc
++++ b/Platform/Radxa/Orion/O6/O6.dsc
+@@ -361,7 +361,9 @@
+ 
+   # USBC0
+   gCixTokenSpaceGuid.PcdUsbCDrdControl0Enable|TRUE
+-  gCixTokenSpaceGuid.PcdUsbCDrdControl0DataRole|FALSE
++  # dmod: device by default, as in CIX's Android O6 BIOS (1.0.0): the fastboot application (Shell command
++  # "fastboot") can then use this port. Setup can still switch it (USB configuration, data role).
++  gCixTokenSpaceGuid.PcdUsbCDrdControl0DataRole|TRUE
+   # USBC1
+   gCixTokenSpaceGuid.PcdUsbCControl0Enable|TRUE
+   # USBC2
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.c b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.c
+new file mode 100644
+index 0000000..4f7f30e
+--- /dev/null
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.c
+@@ -0,0 +1,154 @@
++/** @file
++  dmod: built-in UEFI Shell command "fastboot".
++
++  Registers a Shell dynamic command named "fastboot" that starts the BIOS's own fastboot application (the CIX
++  Fastboot app in the firmware volume, gCixFastBootAppGuid - the same one LaunchFastbootDxe and the setup
++  hotkey start). The Shell checks built-in and dynamic commands before .nsh/.efi files, so "fastboot" works at
++  any Shell prompt, with or without a USB stick. The PC sees the board when the USB-C DRD port is in device role
++  (the default in this BIOS).
++
++  SPDX-License-Identifier: BSD-2-Clause-Patent
++**/
++
++#include <Uefi.h>
++#include <Library/BaseLib.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/DebugLib.h>
++#include <Library/DevicePathLib.h>
++#include <Library/MemoryAllocationLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiLib.h>
++#include <Protocol/FirmwareVolume2.h>
++#include <Protocol/ShellDynamicCommand.h>
++
++STATIC CONST CHAR16  mDmodFastbootHelp[] =
++  L".TH fastboot 0 \"Starts fastboot mode to flash Android from a PC.\"\r\n"
++  L".SH NAME\r\n"
++  L"Starts fastboot mode to flash Android from a PC.\r\n"
++  L".SH SYNOPSIS\r\n"
++  L" \r\n"
++  L"FASTBOOT\r\n"
++  L".SH DESCRIPTION\r\n"
++  L" \r\n"
++  L"NOTES:\r\n"
++  L"  1. Starts the BIOS's own fastboot application on the USB-C data port.\r\n"
++  L"  2. Connect that port to the PC, then on the PC: fastboot devices\r\n"
++  L"  3. The USB-C port must be in device role (default in this dmod BIOS;\r\n"
++  L"     setup: USB configuration, data role).\r\n"
++  L"  4. Added by dmod patch 0005 (built-in command, no USB stick needed).\r\n";
++
++/**
++  Finds the CIX fastboot application in the firmware volumes and returns its device path.
++**/
++STATIC
++EFI_STATUS
++DmodFindFastbootApp (
++  OUT EFI_DEVICE_PATH_PROTOCOL  **DevicePath
++  )
++{
++  EFI_STATUS                         Status;
++  EFI_HANDLE                         *Handles;
++  UINTN                              Count;
++  UINTN                              Index;
++  EFI_FIRMWARE_VOLUME2_PROTOCOL      *Fv;
++  UINTN                              Size;
++  EFI_FV_FILETYPE                    Type;
++  EFI_FV_FILE_ATTRIBUTES             Attributes;
++  UINT32                             AuthStatus;
++  MEDIA_FW_VOL_FILEPATH_DEVICE_PATH  FileNode;
++
++  *DevicePath = NULL;
++  Status      = gBS->LocateHandleBuffer (ByProtocol, &gEfiFirmwareVolume2ProtocolGuid, NULL, &Count, &Handles);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = EFI_NOT_FOUND;
++  for (Index = 0; Index < Count; Index++) {
++    if (EFI_ERROR (gBS->HandleProtocol (Handles[Index], &gEfiFirmwareVolume2ProtocolGuid, (VOID **)&Fv))) {
++      continue;
++    }
++
++    // Buffer NULL: only checks that the file is in this volume
++    if (EFI_ERROR (Fv->ReadFile (Fv, &gCixFastBootAppGuid, NULL, &Size, &Type, &Attributes, &AuthStatus))) {
++      continue;
++    }
++
++    EfiInitializeFwVolDevicepathNode (&FileNode, &gCixFastBootAppGuid);
++    *DevicePath = AppendDevicePathNode (DevicePathFromHandle (Handles[Index]), (EFI_DEVICE_PATH_PROTOCOL *)&FileNode);
++    Status      = (*DevicePath == NULL) ? EFI_OUT_OF_RESOURCES : EFI_SUCCESS;
++    break;
++  }
++
++  FreePool (Handles);
++  return Status;
++}
++
++STATIC
++SHELL_STATUS
++EFIAPI
++DmodFastbootCommandHandler (
++  IN EFI_SHELL_DYNAMIC_COMMAND_PROTOCOL  *This,
++  IN EFI_SYSTEM_TABLE                    *SystemTable,
++  IN EFI_SHELL_PARAMETERS_PROTOCOL       *ShellParameters,
++  IN EFI_SHELL_PROTOCOL                  *Shell
++  )
++{
++  EFI_STATUS                Status;
++  EFI_DEVICE_PATH_PROTOCOL  *DevicePath;
++  EFI_HANDLE                AppHandle;
++
++  Status = DmodFindFastbootApp (&DevicePath);
++  if (EFI_ERROR (Status)) {
++    Print (L"fastboot: the fastboot application is not in this BIOS (%r)\n", Status);
++    return SHELL_NOT_FOUND;
++  }
++
++  Print (L"fastboot: starting fastboot on the USB-C data port. On the PC: fastboot devices\n");
++  Status = gBS->LoadImage (FALSE, gImageHandle, DevicePath, NULL, 0, &AppHandle);
++  FreePool (DevicePath);
++  if (EFI_ERROR (Status)) {
++    Print (L"fastboot: could not load the fastboot application (%r)\n", Status);
++    return SHELL_LOAD_ERROR;
++  }
++
++  Status = gBS->StartImage (AppHandle, NULL, NULL);
++  if (EFI_ERROR (Status)) {
++    Print (L"fastboot: the fastboot application ended with %r\n", Status);
++    return SHELL_ABORTED;
++  }
++
++  return SHELL_SUCCESS;
++}
++
++STATIC
++CHAR16 *
++EFIAPI
++DmodFastbootCommandGetHelp (
++  IN EFI_SHELL_DYNAMIC_COMMAND_PROTOCOL  *This,
++  IN CONST CHAR8                         *Language
++  )
++{
++  return AllocateCopyPool (sizeof (mDmodFastbootHelp), mDmodFastbootHelp);
++}
++
++STATIC EFI_SHELL_DYNAMIC_COMMAND_PROTOCOL  mDmodFastbootCommand = {
++  L"fastboot",
++  DmodFastbootCommandHandler,
++  DmodFastbootCommandGetHelp
++};
++
++EFI_STATUS
++EFIAPI
++DmodFastbootCommandEntry (
++  IN EFI_HANDLE        ImageHandle,
++  IN EFI_SYSTEM_TABLE  *SystemTable
++  )
++{
++  return gBS->InstallProtocolInterface (
++                &ImageHandle,
++                &gEfiShellDynamicCommandProtocolGuid,
++                EFI_NATIVE_INTERFACE,
++                &mDmodFastbootCommand
++                );
++}
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.inf b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.inf
+new file mode 100644
+index 0000000..3573ca6
+--- /dev/null
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.inf
+@@ -0,0 +1,41 @@
++#/** @file
++#  dmod: built-in UEFI Shell command "fastboot".
++#
++#  SPDX-License-Identifier: BSD-2-Clause-Patent
++#**/
++[Defines]
++  INF_VERSION                    = 0x0001001A
++  BASE_NAME                      = DmodFastbootCommandDxe
++  FILE_GUID                      = 6d2f4a8e-3b1c-4f7a-9e55-0c9d8b7a1f42
++  MODULE_TYPE                    = DXE_DRIVER
++  VERSION_STRING                 = 1.0
++  ENTRY_POINT                    = DmodFastbootCommandEntry
++
++[Sources]
++  DmodFastbootCommandDxe.c
++
++[Packages]
++  MdePkg/MdePkg.dec
++  MdeModulePkg/MdeModulePkg.dec
++  ShellPkg/ShellPkg.dec
++  Platform/CIX/Sky1/Sky1.dec
++
++[LibraryClasses]
++  BaseLib
++  BaseMemoryLib
++  DebugLib
++  DevicePathLib
++  MemoryAllocationLib
++  UefiBootServicesTableLib
++  UefiDriverEntryPoint
++  UefiLib
++
++[Protocols]
++  gEfiFirmwareVolume2ProtocolGuid      ## CONSUMES
++  gEfiShellDynamicCommandProtocolGuid  ## PRODUCES
++
++[Guids]
++  gCixFastBootAppGuid                  ## CONSUMES  # CIX fastboot application in the firmware volume
++
++[Depex]
++  TRUE
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.dsc.inc b/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.dsc.inc
+index 19fb191..3b47a77 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.dsc.inc
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.dsc.inc
+@@ -68,6 +68,9 @@
+   Platform/Radxa/Platforms/CIX/Sky1/Drivers/FirmwareConfigUpdateDxe/FirmwareConfigUpdateDxe.inf
+ !endif
+   Platform/Radxa/Platforms/CIX/Sky1/Drivers/SeConfigUpdateDxe/SeConfigUpdateDxe.inf
++!if $(SOC_USB_DEVICE_ENABLE) == TRUE
++  Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.inf  # dmod: Shell command "fastboot"
++!endif
+   EmbeddedPkg/Drivers/DtPlatformDxe/DtPlatformDxe.inf {
+     <LibraryClasses>
+       DtPlatformDtbLoaderLib|EmbeddedPkg/Library/DxeDtPlatformDtbLoaderLibDefault/DxeDtPlatformDtbLoaderLibDefault.inf
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.fdf.inc b/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.fdf.inc
+index 5fc0ede..2ce318f 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.fdf.inc
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Sky1Common.fdf.inc
+@@ -20,6 +20,9 @@
+   INF Platform/Radxa/Platforms/CIX/Sky1/Drivers/FirmwareConfigUpdateDxe/FirmwareConfigUpdateDxe.inf
+ !endif
+   INF Platform/Radxa/Platforms/CIX/Sky1/Drivers/SeConfigUpdateDxe/SeConfigUpdateDxe.inf
++!if $(SOC_USB_DEVICE_ENABLE) == TRUE
++  INF Platform/Radxa/Platforms/CIX/Sky1/Drivers/DmodFastbootCommandDxe/DmodFastbootCommandDxe.inf
++!endif
+   INF EmbeddedPkg/Drivers/DtPlatformDxe/DtPlatformDxe.inf
+ 
+ !if $(VARIABLE_SUPPORT) == "SPI" && $(STMM_SUPPORT) == TRUE

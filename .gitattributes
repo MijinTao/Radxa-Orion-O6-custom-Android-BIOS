@@ -1,0 +1,9 @@
+# Patches and UEFI Shell scripts must keep their exact bytes: several patched edk2 files use CRLF line
+# endings, so the patches contain CRLF lines, and the .nsh scripts are CRLF for the UEFI Shell.
+*.patch    -text
+*.nsh      -text
+
+# Scripts that run inside the Linux build container
+*.sh       text eol=lf
+*.py       text eol=lf
+Dockerfile text eol=lf

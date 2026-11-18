@@ -1,0 +1,159 @@
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni
+index 88b21e3..a97c597 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.uni
+@@ -70,3 +70,8 @@
+ 
+ #string STR_FASTBOOT_HOTKEY             #language en-US "Fastboot hotkey (F)"
+ #string STR_FASTBOOT_HOTKEY_HELP        #language en-US "Enable or disable pressing F during boot countdown to enter Fastboot."
++
++#string STR_DDR_LOW_POWER_PROMPT       #language en-US "DDR Low Power"
++#string STR_DDR_LOW_POWER_PROMPT_HELP  #language en-US "Firmware DDR low-power mode.\n\n"
++                                                       "<Disabled> (default) turns it off at every boot. With it on, sustained CPU/GPU load can make the power-management firmware stop responding, which freezes or resets the board.\n\n"
++                                                       "<Enabled> keeps the firmware default."
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr
+index 6acfe69..f7223c9 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/PlatformConfigDxe/PlatformConfigHii.vfr
+@@ -13,6 +13,7 @@
+ #include <PlatformInfoTypes.h>
+ #include "PlatformConfigHii.h"
+ #include "../../Include/RadxaSetupVar.h"
++#include "../../Include/DmodSetupVar.h"
+ 
+ formset
+   guid      = PLATFORM_CONFIG_FORMSET_GUID,
+@@ -40,6 +41,11 @@ formset
+     name  = RadxaSetupVar,
+     guid  = RADXA_SETUP_VARIABLE_GUID;
+ 
++  efivarstore DMOD_SETUP_DATA,
++    attribute = EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_NON_VOLATILE,
++    name  = DmodSetupVar,
++    guid  = RADXA_SETUP_VARIABLE_GUID;
++
+   efivarstore CONSOLE_PREF_VARSTORE_DATA,
+     attribute = EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_NON_VOLATILE,
+     name  = ConsolePref,
+@@ -121,6 +127,14 @@ endif;
+     endif;
+ #endif // FW_CONFIG_UPDATE_SUPPORT == 1
+ 
++    oneof varid   = DmodSetupVar.DdrLowPower,
++      prompt      = STRING_TOKEN(STR_DDR_LOW_POWER_PROMPT),
++      help        = STRING_TOKEN(STR_DDR_LOW_POWER_PROMPT_HELP),
++      default     = 0,
++      option text = STRING_TOKEN(STR_DISABLED), value = 0, flags = RESET_REQUIRED;
++      option text = STRING_TOKEN(STR_ENABLED),  value = 1, flags = RESET_REQUIRED;
++    endoneof;
++
+     oneof varid     = NetworkStackVar.Enable,
+       prompt        = STRING_TOKEN(STR_NETWORK_STACK_PROMPT),
+       help          = STRING_TOKEN(STR_NETWORK_STACK_PROMPT_HELP),
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c
+index 1e372aa..ebd9535 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.c
+@@ -11,7 +11,53 @@
+ #include <Library/BaseLib.h>
+ #include <Library/BaseMemoryLib.h>
+ #include <Library/PcdLib.h>
++#include <Library/ArmSmcLib.h>
+ #include "../../Include/RadxaSetupVar.h"
++#include "../../Include/DmodSetupVar.h"
++
++// dmod: same SiP call as Linux drivers/soc/cix/cix-ddr-lp.c (CIX_SIP_SET_DDRLP); Arg1: 0 = off, 1 = on.
++#define CIX_SIP_SET_DDRLP  0xC2000010
++
++//
++// dmod: reads DmodSetupVar (creating it with the default, DDR low-power off, when it is missing
++// or not the expected size) and turns the firmware DDR low-power mode off unless it is set to Enabled.
++//
++STATIC
++VOID
++DmodApplyDdrLowPower (
++  VOID
++  )
++{
++  EFI_STATUS       Status;
++  UINTN            VarSize;
++  DMOD_SETUP_DATA  DmodSetupVar;
++  ARM_SMC_ARGS     Args;
++
++  VarSize = sizeof (DmodSetupVar);
++  Status  = gRT->GetVariable (DMOD_SETUP_VAR, &gRadxaSetupVariableGuid, NULL, &VarSize, &DmodSetupVar);
++  if (EFI_ERROR (Status) || (VarSize != sizeof (DmodSetupVar))) {
++    ZeroMem (&DmodSetupVar, sizeof (DmodSetupVar));
++    Status = gRT->SetVariable (
++                    DMOD_SETUP_VAR,
++                    &gRadxaSetupVariableGuid,
++                    EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS,
++                    sizeof (DmodSetupVar),
++                    &DmodSetupVar
++                    );
++    DEBUG ((DEBUG_INFO, "%a: %s created with defaults - %r\n", __func__, DMOD_SETUP_VAR, Status));
++  }
++
++  if (DmodSetupVar.DdrLowPower != DMOD_DDR_LP_OFF) {
++    DEBUG ((DEBUG_INFO, "%a: DDR low-power left at firmware default\n", __func__));
++    return;
++  }
++
++  ZeroMem (&Args, sizeof (Args));
++  Args.Arg0 = CIX_SIP_SET_DDRLP;
++  Args.Arg1 = 0;
++  ArmCallSmc (&Args);
++  DEBUG ((DEBUG_INFO, "%a: DDR low-power turned off (ret 0x%lx)\n", __func__, Args.Arg0));
++}
+ 
+ EFI_STATUS
+ EFIAPI
+@@ -24,6 +70,8 @@ RadxaSetupVariableInitDxeEntry (
+   UINTN             VarSize;
+   RADXA_SETUP_DATA  RadxaSetupVar;
+ 
++  DmodApplyDdrLowPower ();  // dmod
++
+   VarSize = sizeof (RADXA_SETUP_DATA);
+ 
+   Status = gRT->GetVariable (
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf
+index 962ab2e..6ee5fce 100644
+--- a/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Drivers/RadxaSetupVariableInitDxe/RadxaSetupVariableInitDxe.inf
+@@ -38,6 +38,7 @@
+   UefiDriverEntryPoint
+   UefiLib
+   UefiRuntimeServicesTableLib
++  ArmSmcLib  # dmod: DDR low-power SiP call
+ 
+ [Guids]
+   gRadxaTokenSpaceGuid
+diff --git a/Platform/Radxa/Platforms/CIX/Sky1/Include/DmodSetupVar.h b/Platform/Radxa/Platforms/CIX/Sky1/Include/DmodSetupVar.h
+new file mode 100644
+index 0000000..4e15145
+--- /dev/null
++++ b/Platform/Radxa/Platforms/CIX/Sky1/Include/DmodSetupVar.h
+@@ -0,0 +1,22 @@
++#ifndef _DMOD_SETUP_VAR_H_
++#define _DMOD_SETUP_VAR_H_
++
++//
++// dmod settings. Kept in their own UEFI variable so Radxa's RadxaSetupVar stays exactly as stock.
++// Same vendor GUID as RadxaSetupVar (RADXA_SETUP_VARIABLE_GUID), different name.
++//
++#define DMOD_SETUP_VAR  L"DmodSetupVar"
++
++// DdrLowPower: firmware DDR low-power mode (CIX SiP call 0xC2000010)
++#define DMOD_DDR_LP_OFF  0   // default: turned off at every boot
++#define DMOD_DDR_LP_ON   1   // leave the firmware default
++
++#pragma pack(1)
++
++typedef struct {
++  UINT8     DdrLowPower;
++} DMOD_SETUP_DATA;
++
++#pragma pack()
++
++#endif
