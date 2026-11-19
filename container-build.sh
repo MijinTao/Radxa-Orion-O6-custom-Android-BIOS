@@ -51,11 +51,12 @@ INFO="/out/${PKG_NAME}-build-info"
 # Name patch 0001 gives the BIOS (setup page, boot console, SMBIOS)
 DMOD_LABEL="Android-${EDK2_CIX_REF}-dmod"
 # Which features the patches folder carries (the checks below follow them)
-HAS_DDR=0; HAS_WIPE=0; HAS_FBCMD=0
+HAS_DDR=0; HAS_WIPE=0; HAS_FBCMD=0; HAS_ASPM=0
 if [[ "$PATCHES" == "1" ]]; then
   if compgen -G "${PATCH_DIR}/*/*ddr-low-power*.patch" >/dev/null; then HAS_DDR=1; fi
   if compgen -G "${PATCH_DIR}/*/*wipe-android*.patch" >/dev/null; then HAS_WIPE=1; fi
   if compgen -G "${PATCH_DIR}/*/*fastboot-command*.patch" >/dev/null; then HAS_FBCMD=1; fi
+  if compgen -G "${PATCH_DIR}/*/*pcie-aspm*.patch" >/dev/null; then HAS_ASPM=1; fi
 fi
 
 log() { echo -e "\n\033[1;36m==> $*\033[0m"; }
@@ -138,9 +139,10 @@ if [[ "$PATCHES" == "1" ]]; then
   # The patch features must be in the built modules: setup option texts (HII strings, UTF-16) in
   # PlatformConfigDxe, variable names in RadxaSetupVariableInitDxe, the fastboot command driver, and the
   # BIOS name (PcdFirmwareVersionString, UTF-16) somewhere.
-  python3 -I - "$BUILD_DIR/AARCH64" "$DMOD_LABEL" "$HAS_DDR" "$HAS_WIPE" "$HAS_FBCMD" <<'PY' || { echo "ERROR: the patch features are not in the built firmware" >&2; exit 1; }
+  python3 -I - "$BUILD_DIR/AARCH64" "$DMOD_LABEL" "$HAS_DDR" "$HAS_WIPE" "$HAS_FBCMD" "$HAS_ASPM" <<'PY' || { echo "ERROR: the patch features are not in the built firmware" >&2; exit 1; }
 import pathlib, sys
 d, label, want_ddr, want_wipe, want_fbcmd = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3] == "1", sys.argv[4] == "1", sys.argv[5] == "1"
+want_aspm = len(sys.argv) > 6 and sys.argv[6] == "1"
 def has(path, text): return path.is_file() and text.encode("utf-16-le") in path.read_bytes()
 ok = True
 pc, rs = d / "PlatformConfigDxe.efi", d / "RadxaSetupVariableInitDxe.efi"
@@ -151,6 +153,8 @@ if want_wipe:
     checks += [("Wipe Android option", pc, "Wipe Android data at next boot"), ("DmodWipeAndroid in DXE", rs, "DmodWipeAndroid")]
 if want_fbcmd:
     checks += [("Shell command fastboot", d / "DmodFastbootCommandDxe.efi", "fastboot: starting fastboot")]
+if want_aspm:
+    checks += [("ASPM default migration", d / "PlatformSetupVariableInitDxe.efi", "DmodAspmDefault")]
 for name, f, text in checks:
     r = has(f, text)
     print(f"  {name:24s} {'yes' if r else 'no'}"); ok &= r

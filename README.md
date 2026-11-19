@@ -1,7 +1,7 @@
 # Radxa Orion O6 custom Android BIOS
 
 An Android BIOS (UEFI firmware) for the **Radxa Orion O6** and **Orion O6N**, built in Docker from Radxa's
-official sources, [radxa-pkg/edk2-cix](https://github.com/radxa-pkg/edk2-cix) **1.3.2**, plus five small
+official sources, [radxa-pkg/edk2-cix](https://github.com/radxa-pkg/edk2-cix) **1.3.2**, plus six small
 patches. The BIOS calls itself **`Android-1.3.2-dmod`** on the setup page, on the boot console and in SMBIOS.
 
 **Tested on a Radxa Orion O6 with Android 16. The O6N build uses the same patches but hasn't been tested on
@@ -65,7 +65,7 @@ to flash.
 
 ## The patches
 
-All five patches change `edk2-platforms` and are applied in order. Besides them, the build makes the one change
+All six patches change `edk2-platforms` and are applied in order. Besides them, the build makes the one change
 that turns Radxa's build into an Android BIOS: `-D FASTBOOT_LOAD=nvme -D SYSTEM_LOADER=android` in
 `src/Makefile`, the same flags CIX's own Android build uses.
 
@@ -92,8 +92,17 @@ that turns Radxa's build into an Android BIOS: `-D FASTBOOT_LOAD=nvme -D SYSTEM_
    is no reference for which O6N port fastboot uses: switch the data role in setup if the PC doesn't see the
    board.
 
-Patches 0001–0004 and the `fastboot` command change files shared by both boards, so the O6N build gets them
-too.
+6. **`0006-dmod-pcie-aspm-off-by-default`**: PCIe ASPM (link power management) is **off** by default on all five
+   O6 root ports ("ASPM Disable"), as in Radxa's Android 1.0.0 BIOS. With 1.3.2's default (L0s+L1), the board froze
+   under Android: a CPU access to the NVMe, Wi-Fi or 2.5 GbE link that didn't come back from L1 hung the whole board.
+   A settings variable from an earlier 1.3.2 build keeps its stored ASPM values, so on the first boot the patch
+   sets them to the new default once and records that in the variable `DmodAspmDefault`; a later change in setup is
+   kept. Note: under Linux in DT mode the kernel's own ASPM policy decides in the end (Android's kernel uses
+   `CONFIG_PCIEASPM_PERFORMANCE`); this patch makes the firmware side match.
+
+Patches 0001–0004, the `fastboot` command and the ASPM migration code change files shared by both boards, so the
+O6N build gets them too. The O6N's ASPM default (its own `O6N.dsc`) is left as Radxa set it, so on the O6N the
+migration changes nothing.
 
 ## Flashing
 
